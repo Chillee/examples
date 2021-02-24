@@ -130,11 +130,18 @@ def decompose(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
                 new_node = decomposition_rules[node.target](*proxy_args, **proxy_kwargs).node
                 new_node.shape = node.shape
                 env[node.name] = new_node
+            elif node.op == 'call_method' and hasattr(torch, node.target):
+                proxy_args = map_arg(node.args, lambda n: env[n.name])
+                proxy_kwargs = map_arg(node.kwargs, lambda n: env[n.name])
+                new_node = new_graph.call_function(getattr(torch, node.target), proxy_args, proxy_kwargs)
+                new_node.shape = node.shape
+                env[node.name] = new_node
             else:
                 new_node = new_graph.node_copy(node, lambda x: env[x.name])
                 if hasattr(node, 'shape'):
                     new_node.shape = node.shape
                 env[node.name] = new_node
+        new_graph.lint()
         model = fx.GraphModule(model, new_graph)
     return model
 

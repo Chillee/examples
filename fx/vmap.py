@@ -162,36 +162,102 @@ def vmap(model: torch.nn.Module, in_axes: Tuple[Optional[int], ...], example_arg
     res.graph.lint()
     return res
 
-x = torch.randn(3, 5)
-y = torch.randn(2)
-class M(nn.Module):
-    def forward(self, a, b):
-        return torch.mul(a, b)
+vjp_map = {}
 
-# Although this function actually takes in many shapes (due to broadcasting
-# rules and such), pretend that M() operates only on scalars.
-# The first thing we do is to turn this into a vector scalar multiplication. To
-# do so, we will batch along the first dimension to turn it into a vector.
-# We provide example_args to specify the original shapes of the function.
-model = vmap(M(), in_axes=(None, 0), example_args=(x[0][0], y[0]))
+def add_vjp(g, a, b):
+    if isinstance(a, fx.Proxy) and isinstance(b, fx.Proxy):
+        assert(a.shape == b.shape)
+    return g, g
 
-# Now, our shape signature is ((), (M,)) -> (M,). This is computing the
-# outer product of 2 vectors.
-print(model(x[0][0], y) .shape)  # ((), (2,)) -> (2,)
+def sub_vjp(g, a, b):
+    if isinstance(a, fx.Proxy) and isinstance(b, fx.Proxy):
+        assert(a.shape == b.shape)
+    return g, -g
 
-# Now, we want to turn this from a scalar vector multiplication into a vector
-# vector multiplication. That is, we would like to have the shape signature of
-# ((N,), (M,)) -> (N, M). To do so, we will batch along the second argument.
-# This is also known as an outer product.
+def mul_vjp(g, a, b):
+    if isinstance(a, fx.Proxy) and isinstance(b, fx.Proxy):
+        assert(a.shape == b.shape)
+    return g * b, g * a
 
-model = vmap(model, in_axes=(0, None), example_args=(x[0][0], y))
+def div_vjp(g, a, b):
+    if isinstance(a, fx.Proxy) and isinstance(b, fx.Proxy):
+        assert(a.shape == b.shape)
+    return g *(1/b), g * (-a / (b**2.0))
 
-print(model(x[0], y).shape)  # ((5,), (2,)) -> (5,2)
+def pow_vjp(g, a, b):
+    if isinstance(b, fx.Proxy):
+        raise RuntimeError("nyi")
+    return g * b*a*(b-1), None
+
+def sum_vjp(g, x):
+    return g.expand(x.shape)
+
+vjp_map[torch.add] = add_vjp
+vjp_map[torch.sub] = sub_vjp
+vjp_map[torch.mul] = mul_vjp
+vjp_map[torch.div] = div_vjp
+vjp_map[torch.sum] = sum_vjp
+vjp_map[torch.pow] = pow_vjp
+
+def grad(model: torch.nn.Module, example_inps: Tuple[Any, ...], get_value=True) -> torch.nn.Module:
+    fx_model = fx.symbolic_trace(model)
+    ShapeProp(fx_model).propagate(*example_inps)
+    # graph and append to that.
+    val_map = {}
+    new_graph: fx.Graph = fx.Graph()
+    orig_output = new_graph.graph_copy(fx_model.graph, val_map)
+    def shape_proxy(node):
+        proxy = fx.Proxy(val_map[node])
+        proxy.shape = node.shape
+        proxy.dim = lambda : len(proxy.shape)
+        return proxy
+    inputs = []
+    ones = new_graph.create_node('call_function', torch.ones, ([],))
+
+    for node in reversed(fx_model.graph.nodes):
+        if node.op == 'output':
+            assert(len(node.args) == 1)
+            val_map[node.args[0]].grad = [fx.Proxy(ones)]
+        elif node.op == 'placeholder':
+            inputs.append(sum(val_map[node].grad).node)
+        elif node.op == 'call_function':
+            g = sum(val_map[node].grad)
+            new_args = [shape_proxy(i) if isinstance(i, fx.Node) else i for i in node.args]
+            if node.target not in vjp_map:
+                raise RuntimeError("vjp not yet implemented")
+            new_grads = vjp_map[node.target](g, *new_args)
+            if not isinstance(new_grads, tuple):
+                new_grads = (new_grads,)
+            for new_g, arg in zip(new_grads, new_args):
+                if isinstance(arg, fx.Proxy):
+                    if not hasattr(arg.node, 'grad'):
+                        arg.node.grad = []
+                    arg.node.grad.append(new_g)
+        elif node.op == 'call_method':
+            raise RuntimeError("doesn't support methods since i'm lazy")
+
+    if len(inputs) == 1:
+        inputs = inputs[0]
+    else:
+        inputs = inputs[::-1]
+    if get_value:
+        new_graph.output((orig_output, inputs))
+    else:
+        new_graph.output(inputs)
+    res = fx.GraphModule(fx_model, new_graph)
+    res.graph.lint()
+    return res
 
 
-# We can continue to add an arbitary number of batch dimensions to our input.
-# If we add another batch dimension to the first input we now get a batched
-# outer product computation. ((B, N), (M,)) -> (B, N, M)
 
-model = vmap(model, in_axes=(0, None), example_args=(x[0], y))
-print(model(x, y).shape)  # ((3, 5), (2,)) -> (3, 5, 2)
+if __name__ == '__main__':
+    from nnc_compile import decompose
+    def f(x):
+        return 0.5 * torch.sum(x)
+    example_inps = (torch.randn(5),)
+    f = decompose(f, example_inputs=example_inps)
+    f_g = grad(f, example_inps=example_inps, get_value=True)
+
+    out =  torch.autograd.functional.vjp(f, example_inps)
+    print(out)
+    print(f_g(*example_inps))
