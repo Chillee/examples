@@ -55,6 +55,7 @@ import torch.fx as fx
 from torch.fx import map_arg
 from torch.fx.passes.shape_prop import ShapeProp
 import operator
+scope = te.KernelScope()
 
 # Decomposition Pass
 
@@ -76,7 +77,8 @@ binary_decompositions = [
     (operator.lt, torch.lt),
     (operator.le, torch.le),
     (operator.ne, torch.ne),
-    (operator.and_, torch.bitwise_and)
+    (operator.and_, torch.bitwise_and),
+    (operator.pow, torch.pow)
 ]
 for old, new in binary_decompositions:
     decomposition_rules[old] = binary_mapping(new)
@@ -85,13 +87,32 @@ def addmm_decompose(input, mat1, mat2, beta=1, alpha=1, out=None):
     assert(out is None)
     return beta*input + alpha*(torch.mm(mat1, mat2))
 
+def matmul_decompose(A, B, out=None):
+    assert(out is None)
+    if A.dim() == 1 and B.dim() == 1:
+        return torch.dot(A, B)
+    if A.dim() == 2 and B.dim() == 2:
+        return torch.mm(A, B)
+    if A.dim() == 2 and B.dim() == 1:
+        return torch.mv(A, B)
+    else:
+        raise RuntimeError("nyi")
+
 decomposition_rules[torch.addmm] = addmm_decompose
+decomposition_rules[operator.neg] = lambda x: 0 - x
+decomposition_rules[torch.matmul] = matmul_decompose
 
 def decompose(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
     """
     decompose(model, example_inputs) takes in a model, decomposes any of the functions in `decomposition_rules` to its constituent operations, and returns a `nn.Module` without any of the operations with decomposition rules.
     """
     # Run it multiple times so we converge to a fixed point.
+    def shape_proxy(node):
+        proxy = fx.Proxy(node)
+        proxy.shape = node.shape
+        proxy.dim = lambda : len(proxy.shape)
+        return proxy
+
     for _ in range(5):
         model = fx.symbolic_trace(model)
         ShapeProp(model).propagate(*example_inputs)
@@ -104,12 +125,15 @@ def decompose(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
                 # decomposition rule. See
                 # https://pytorch.org/docs/master/fx.html#proxy-retracing for
                 # more details.
-                proxy_args = map_arg(node.args, lambda n: fx.Proxy(env[n.name]))
-                proxy_kwargs = map_arg(node.kwargs, lambda n: fx.Proxy(env[n.name]))
+                proxy_args = map_arg(node.args, lambda n: shape_proxy(env[n.name]))
+                proxy_kwargs = map_arg(node.kwargs, lambda n: shape_proxy(env[n.name]))
                 new_node = decomposition_rules[node.target](*proxy_args, **proxy_kwargs).node
+                new_node.shape = node.shape
                 env[node.name] = new_node
             else:
                 new_node = new_graph.node_copy(node, lambda x: env[x.name])
+                if hasattr(node, 'shape'):
+                    new_node.shape = node.shape
                 env[node.name] = new_node
         model = fx.GraphModule(model, new_graph)
     return model
@@ -140,6 +164,8 @@ lowering_functions = {}
 
 def wrap_compute(f):
     def fn_lower(name, out_shape, inp_shapes, args):
+        if len(out_shape) == 0:
+            out_shape = [1]
         X = te.Compute(name, get_dim_args(out_shape), f(inp_shapes, args))
         return X
     return fn_lower
@@ -229,6 +255,7 @@ binary_lowerings = [
 (torch.lt,lambda a, b: a<b),
 (torch.ge,lambda a, b: a>=b),
 (torch.le,lambda a, b: a<=b),
+(torch.pow, lambda a, b: te.pow(a, b)),
 ]
 for torch_op, nnc_fn in binary_lowerings:
     lowering_functions[torch_op] = wrap_compute(gen_binary_nnc(nnc_fn))
@@ -317,8 +344,33 @@ def mm_lower(name, out_shape, inp_shapes, args):
     mm = te.Compute('mm', get_dim_args([N,P,M]), f)
     return te.Reduce(name, get_dim_args([N, P]), te.Sum(), mm, get_dim_args([M]))
 
+def mv_lower(name, out_shape, inp_shapes, args):
+    A = args[0]
+    B = args[1]
+    N, M = inp_shapes[0][0]
+
+    def f(n, m):
+        return A.load([n, m]) * B.load([m])
+    mm = te.Compute('mm', get_dim_args([N,M]), f)
+    return te.Reduce(name, get_dim_args([N]), te.Sum(), mm, get_dim_args([M]))
+
+def dot_lower(name, out_shape, inp_shapes, args):
+    A, B = args
+    N = inp_shapes[0][0][0]
+    def f(n):
+        return A.load([n]) * B.load([n])
+    res = te.Compute('mul', get_dim_args([N]), f)
+    return te.Reduce(name, get_dim_args([]), te.Sum(), res, get_dim_args([N]))
+
 lowering_functions[torch.bmm] = bmm_lower
 lowering_functions[torch.mm] = mm_lower
+lowering_functions[torch.mv] = mv_lower
+lowering_functions[torch.dot] = dot_lower
+def sum_lower(name, out_shape, inp_shapes, args):
+    assert(len(args) == 1)
+    A = args[0]
+    return te.Reduce(name, get_dim_args([]), te.Sum(), A, get_dim_args(inp_shapes[0][0]))
+lowering_functions[torch.sum] = sum_lower
 
 
 def lower_function(node, op, nnc_args, args):
@@ -385,22 +437,40 @@ def nnc_compile(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
             result = lower_function(node, node.target, lookup_env(node.args), node.args)
             env[node.name] = result
         elif node.op == 'output':
-            outs = list(lookup_env(node.args))
+            args = node.args
+            if not isinstance(args, tuple):
+                args = (args,)
+            if isinstance(args[0], tuple):
+                args = args[0]
+            te_args = lookup_env(args)
+            outs = (list(te_args), [i.shape for i in args])
         elif node.op == 'get_attr':
             # As NNC doesn't have any concept of state, we pull out the module
             # attributes and pass them in as inputs to NNC.
             module_attrs.append(node)
+            shapes = get_te_shapes(node)
             env[node.name] = te.Placeholder(node.name, get_te_type(node), shapes)
         else:
             raise RuntimeError("not yet implemented")
 
-    loopnest = te.LoopNest(outs)
+    loopnest = te.LoopNest(outs[0])
     loopnest.prepare_for_codegen()
     stmt = te.simplify(loopnest.root_stmt())
-    cg = te.construct_codegen('llvm', stmt, [te.BufferArg(x) for x in [env[i.name] for i in module_attrs] + inputs + outs])
-    def f(inps):
-        module_stuff = [fetch_attr(i.target) for i in module_attrs]
-        cg.call(module_stuff + list(inps))
+    cg = te.construct_codegen('llvm', stmt, [te.BufferArg(x) for x in [env[i.name] for i in module_attrs] + inputs + outs[0]])
+    def f(*inps, out_tensors=None):
+        if out_tensors is None:
+            results = [torch.empty(i) for i in outs[1]]
+        else:
+            results = out_tensors
+        if module_attrs:
+            module_stuff = [fetch_attr(i.target).data for i in module_attrs]
+        else:
+            module_stuff = []
+        cg.call(module_stuff + list(inps) + results)
+        if out_tensors is None:
+            if len(results) == 1:
+                return results[0]
+            return results
     return f
 
 
@@ -429,47 +499,46 @@ if __name__ == '__main__':
             fc1 = torch.addmm(self.fc_b, inp, t1)
             return fc1
 
-    with kernel_arena_scope():
-        with torch.no_grad():
-            num_features = 50
-            mod = DeepAndWide(num_features)
+    with torch.no_grad():
+        num_features = 50
+        mod = DeepAndWide(num_features)
 
-            # Phabricate sample inputs
-            batch_size = 1
-            embedding_size = 32
-            ad_emb_packed = torch.randn(batch_size, 1, embedding_size)
-            user_emb = torch.randn(batch_size, 1, embedding_size)
-            wide = torch.randn(batch_size, num_features)
-            inps = (ad_emb_packed, user_emb, wide)
-            out = torch.empty(batch_size, 1)
+        # Phabricate sample inputs
+        batch_size = 1
+        embedding_size = 32
+        ad_emb_packed = torch.randn(batch_size, 1, embedding_size)
+        user_emb = torch.randn(batch_size, 1, embedding_size)
+        wide = torch.randn(batch_size, num_features)
+        inps = (ad_emb_packed, user_emb, wide)
+        out = torch.empty(batch_size, 1)
 
-            mod = decompose(mod, inps)
-            cg = nnc_compile(mod, inps)
+        mod = decompose(mod, inps)
+        cg = nnc_compile(mod, inps)
 
-            iters = 1000
+        iters = 1000
 
-            for _ in range(10):
-                cg([ad_emb_packed, user_emb,wide, out])
-            begin = time.time()
-            for _ in range(iters):
-                cg([ad_emb_packed, user_emb,wide, out])
+        for _ in range(10):
+            cg(ad_emb_packed, user_emb,wide, out_tensors=[out])
+        begin = time.time()
+        for _ in range(iters):
+            cg(ad_emb_packed, user_emb,wide, out_tensors=[out])
 
-            print("NNC time: ", time.time()-begin)
+        print("NNC time: ", time.time()-begin)
 
-            mod_jit = torch.jit.script(DeepAndWide(num_features))
-            for _ in range(10):
-                mod_jit(ad_emb_packed, user_emb,wide)
-            begin = time.time()
-            for _ in range(iters):
-                mod_jit(ad_emb_packed, user_emb,wide)
-            print("PyTorch time", time.time()-begin)
+        mod_jit = torch.jit.script(DeepAndWide(num_features))
+        for _ in range(10):
+            mod_jit(ad_emb_packed, user_emb,wide)
+        begin = time.time()
+        for _ in range(iters):
+            mod_jit(ad_emb_packed, user_emb,wide)
+        print("PyTorch time", time.time()-begin)
 
-            static_runtime = torch._C._jit_to_static_runtime(mod_jit._c)
-            for _ in range(10):
-                static_runtime.run([ad_emb_packed, user_emb,wide])
-            begin = time.time()
-            for _ in range(iters):
-                static_runtime.run([ad_emb_packed, user_emb,wide])
-            print("Static Runtime time", time.time()-begin)
+        static_runtime = torch._C._jit_to_static_runtime(mod_jit._c)
+        for _ in range(10):
+            static_runtime.run([ad_emb_packed, user_emb,wide])
+        begin = time.time()
+        for _ in range(iters):
+            static_runtime.run([ad_emb_packed, user_emb,wide])
+        print("Static Runtime time", time.time()-begin)
 
-            print("Sums:", out.sum(), mod(*inps).sum())
+        print("Sums:", out.sum(), mod(*inps).sum())
