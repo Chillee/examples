@@ -82,7 +82,7 @@ def kinetic_fn(inverse_mass_matrix, p):
 
     return 0.5 * np.dot(v, p)
 
-D = 100
+D = 1000
 
 true_mean, true_std = np.ones(D), np.ones(D) * 2.
 
@@ -129,7 +129,7 @@ timefn = lambda i: fn(kinetic_fn, potential_fn, inv_mass_matrix,
 
 # Run only once in a loop; otherwise the best number reported
 # does not include compilation time.
-out = timefn(0)
+out = timefn(0)[0]['z'].block_until_ready()
 
 begin = time.time()
 out = timefn(0)
