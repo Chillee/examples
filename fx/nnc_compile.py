@@ -50,6 +50,7 @@
 import time
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch._C._te as te
 import torch.fx as fx
 from torch.fx import map_arg
@@ -102,17 +103,101 @@ decomposition_rules[torch.addmm] = addmm_decompose
 decomposition_rules[operator.neg] = lambda x: 0 - x
 decomposition_rules[torch.matmul] = matmul_decompose
 
+
+def method_torch_decompose(method):
+    def f(self, *args):
+        return getattr(torch, method)(self, *args)
+    return f
+
+tensor_methods_simple = ['add', 'sub', 'mul', 'div']
+
+for meth in tensor_methods_simple:
+    decomposition_rules[(torch.Tensor, meth)] = method_torch_decompose(meth)
+
+def method_reshape_decompose(self, *shape):
+    return torch.reshape(self, shape)
+
+decomposition_rules[(torch.Tensor, 'reshape')] = method_reshape_decompose
+
+def method_t_decompose(self):
+    assert(self.dim() <= 2)
+    if self.dim() < 2: return self
+    else: return torch.transpose(self, 1, 0)
+decomposition_rules[(torch.Tensor, 't')] = method_t_decompose
+
+def module_conv2d_decompose(module, x):
+    return F.conv2d(x, module.weight, module.bias, module.stride, module.padding, module.dilation, module.groups)
+
+def module_relu6_decompose(module, x):
+    return torch.clamp(x, 0.0, 6.0)
+
+def module_dropout_decompose(module, x):
+    if module.training == False:
+        return x
+    else:
+        return F.dropout(x, module.p, module.training)
+
+def module_linear_decompose(module, x):
+    weight, bias = module.weight, module.bias
+    if x.dim() == 2 and bias is not None:
+        # fused op is marginally faster
+        ret = torch.addmm(bias, x, weight.t())
+    else:
+        output = x.matmul(weight.t())
+        if bias is not None:
+            output += bias
+        ret = output
+    return ret
+
+decomposition_rules[nn.Conv2d] = module_conv2d_decompose
+decomposition_rules[nn.ReLU6] = module_relu6_decompose
+decomposition_rules[nn.Dropout] = module_dropout_decompose
+decomposition_rules[nn.Linear] = module_linear_decompose
+
+def shape_proxy(node):
+    proxy = fx.Proxy(node)
+    if hasattr(node, 'shape'):
+        proxy.shape = node.shape
+        proxy.dim = lambda : len(proxy.shape)
+    return proxy
+
+def fetch_attr(module, target : str):
+    target_atoms = target.split('.')
+    attr_itr = module
+    for i, atom in enumerate(target_atoms):
+        if not hasattr(attr_itr, atom):
+            raise RuntimeError(f"Node referenced nonexistent target {'.'.join(target_atoms[:i])}")
+        attr_itr = getattr(attr_itr, atom)
+    return attr_itr
+
+def remove_shapes(model, example_inputs):
+    model = fx.symbolic_trace(model)
+    ShapeProp(model).propagate(*example_inputs)
+    new_graph = fx.Graph()
+    env = {}
+    for node in model.graph.nodes:
+        if node.op == 'call_function' and node.target == torch.reshape:
+            proxy_args = map_arg(node.args, lambda n: shape_proxy(env[n.name]))
+            proxy_kwargs = map_arg(node.kwargs, lambda n: shape_proxy(env[n.name]))
+            new_node = torch.reshape(proxy_args[0], node.shape).node
+            new_node.shape = node.shape
+            env[node.name] = new_node
+        else:
+            new_node = new_graph.node_copy(node, lambda x: env[x.name])
+            if hasattr(node, 'shape'):
+                new_node.shape = node.shape
+            env[node.name] = new_node
+    new_graph.lint()
+    model = fx.GraphModule(model, new_graph)
+    return model
+
+
+
 def decompose(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
     """
     decompose(model, example_inputs) takes in a model, decomposes any of the functions in `decomposition_rules` to its constituent operations, and returns a `nn.Module` without any of the operations with decomposition rules.
     """
     # Run it multiple times so we converge to a fixed point.
-    def shape_proxy(node):
-        proxy = fx.Proxy(node)
-        proxy.shape = node.shape
-        proxy.dim = lambda : len(proxy.shape)
-        return proxy
-
     for _ in range(5):
         model = fx.symbolic_trace(model)
         ShapeProp(model).propagate(*example_inputs)
@@ -130,10 +215,23 @@ def decompose(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
                 new_node = decomposition_rules[node.target](*proxy_args, **proxy_kwargs).node
                 new_node.shape = node.shape
                 env[node.name] = new_node
-            elif node.op == 'call_method' and hasattr(torch, node.target):
-                proxy_args = map_arg(node.args, lambda n: env[n.name])
-                proxy_kwargs = map_arg(node.kwargs, lambda n: env[n.name])
-                new_node = new_graph.call_function(getattr(torch, node.target), proxy_args, proxy_kwargs)
+            elif node.op == 'call_method' and (torch.Tensor, node.target) in decomposition_rules:
+                proxy_args = map_arg(node.args, lambda n: shape_proxy(env[n.name]))
+                proxy_kwargs = map_arg(node.kwargs, lambda n: shape_proxy(env[n.name]))
+                new_node = decomposition_rules[(torch.Tensor, node.target)](*proxy_args, **proxy_kwargs).node
+                new_node.shape = node.shape
+                env[node.name] = new_node
+            elif node.op == 'call_module' and type(fetch_attr(model, node.target)) in decomposition_rules:
+                proxy_args = map_arg(node.args, lambda n: shape_proxy(env[n.name]))
+                proxy_kwargs = map_arg(node.kwargs, lambda n: shape_proxy(env[n.name]))
+                module = fetch_attr(model, node.target)
+                unset_keys = []
+                for key in module.state_dict():
+                    module.__dict__[key] = fx.Proxy(new_graph.get_attr(node.target+'.' + key))
+                    unset_keys.append(key)
+                new_node = decomposition_rules[type(module)](module, *proxy_args, **proxy_kwargs).node
+                for key in unset_keys:
+                    del module.__dict__[key]
                 new_node.shape = node.shape
                 env[node.name] = new_node
             else:
@@ -143,6 +241,7 @@ def decompose(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
                 env[node.name] = new_node
         new_graph.lint()
         model = fx.GraphModule(model, new_graph)
+    model = remove_shapes(model, example_inputs)
     return model
 
 # NNC Lowering Pass
@@ -169,8 +268,7 @@ def to_expr(x):
     elif isinstance(x, float):
         return te.ExprHandle.float(x)
     else:
-        print(x)
-        raise RuntimeError("type not supported")
+        raise RuntimeError(f"type {type(x)} not supported")
 
 def get_nnc_type(dtype):
     if dtype == torch.float:
@@ -300,15 +398,17 @@ def transpose_lower(name, out_shape, inp_shapes, args):
         return args[0].load(idxs)
     return te.Compute(name, get_dim_args(out_shape), f)
 
+def prod(x, start=1):
+    t = start
+    for i in x: t *= i
+    return t
+
 def flatten_lower(name, out_shape, inp_shapes, args):
     A, start_dim, end_dim = args
     shape = list(inp_shapes[0][0])
+    if end_dim < 0:
+        end_dim = len(shape) + end_dim
     flattened_region = shape[start_dim:end_dim+1]
-    def prod(x):
-        t = 1
-        for i in x:
-            t *= i
-        return t
     def get_orig_idxs(i):
         idxs = []
         total = prod(flattened_region)
@@ -397,15 +497,68 @@ lowering_functions[torch.bmm] = bmm_lower
 lowering_functions[torch.mm] = mm_lower
 lowering_functions[torch.mv] = mv_lower
 lowering_functions[torch.dot] = dot_lower
+
 def sum_lower(name, out_shape, inp_shapes, args):
     assert(len(args) == 1)
     A = args[0]
     return te.Reduce(name, get_dim_args([]), te.Sum(), A, get_dim_args(inp_shapes[0][0]))
+
 lowering_functions[torch.sum] = sum_lower
+
+def conv2d_lower(name, out_shape, inp_shapes, args):
+    X, W, B, stride, padding, dilation, groups = args
+    out = te.BufHandle('out', get_te_shapes(out_shape), get_nnc_type(inp_shapes[0][1]))
+
+    conv_spec = list(stride)+list(padding) + list(dilation) + [groups]
+    conv_spec = [to_expr(i) for i in conv_spec]
+    s = te.ExternalCall(out, "nnc_aten_conv2d", [X, W, B], conv_spec)
+    return out, [s]
+
+def adaptive_avg_pool2d_lower(name, out_shape, inp_shapes, args):
+    X, output_size = args
+    out = te.BufHandle('out', get_te_shapes(out_shape), get_nnc_type(inp_shapes[0][1]))
+    if isinstance(output_size, int):
+        output_size = [output_size, output_size]
+    output_size = [to_expr(i) for i in output_size]
+    s = te.ExternalCall(out, "nnc_aten_adaptive_avg_pool2d", [X], output_size)
+    return out, [s]
+
+def encode_idxs(shape, idxs):
+    assert(len(shape) == len(idxs))
+    cur = 1
+    out = to_expr(0)
+    for dim, idx in reversed(list(zip(shape, idxs))):
+        out += to_expr(cur) * idx
+        cur *= dim
+    return out
+
+def reshape_lower(name, out_shape, inp_shapes, args):
+    X, shape = args
+    start_shape = list(inp_shapes[0][0])
+    end_shape = out_shape
+    def get_orig_idxs(idxs):
+        absolute_new = encode_idxs(end_shape, idxs)
+        new_idxs = []
+        total_old = prod(start_shape)
+        for dim in start_shape:
+            total_old //= dim
+            new_idxs.append(absolute_new / to_expr(total_old))
+            absolute_new %= to_expr(total_old)
+        return new_idxs
+
+    def f(*idxs):
+        idxs = list(idxs)
+        orig_idxs = get_orig_idxs(idxs)
+        return X.load(orig_idxs)
+    return te.Compute(name, get_dim_args(out_shape), f)
+
+lowering_functions[F.conv2d] = conv2d_lower
+lowering_functions[F.adaptive_avg_pool2d] = adaptive_avg_pool2d_lower
+lowering_functions[torch.reshape] = reshape_lower
 
 
 def lower_function(node, op, nnc_args, args):
-    inp_shapes = fx.node.map_aggregate(args, lambda arg: (arg.shape, arg.dtype) if isinstance(arg, fx.Node) else None)
+    inp_shapes = fx.node.map_aggregate(args, lambda arg: (arg.shape, arg.dtype) if isinstance(arg, fx.Node) and hasattr(arg, 'shape') else None)
     out = lowering_functions[op](node.name, node.shape, inp_shapes, nnc_args)
     if isinstance(out, te.Tensor):
         return out.buf(), [out.stmt()]
@@ -437,7 +590,8 @@ def nnc_compile(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
         te_args = [env[arg.name] for arg in args]
 
     def lookup_env(l):
-        return fx.node.map_aggregate(l, lambda x: env[x.name] if isinstance(x, fx.Node) else x)
+        res = fx.node.map_aggregate(l, lambda x: env[x.name] if isinstance(x, fx.Node) else x)
+        return res
 
     def fetch_attr(target : str):
         target_atoms = target.split('.')
@@ -464,10 +618,17 @@ def nnc_compile(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
             # This does the bulk of the work - we call `lower_function`, which
             # returns a `te.ExprHandle` (the output of a NNC computation), and
             # put it in our environment.
-            buf, stmt = lower_function(node, node.target, lookup_env(node.args), node.args)
-            # if isinstance(stmt, list)
-            compute_stmts.extend(stmt)
-            env[node.name] = buf
+            if hasattr(node, 'shape'):
+                # todo: fix kwargs handling
+                if node.kwargs:
+                    raise RuntimeError("kwargs nyi")
+                buf, stmt = lower_function(node, node.target, lookup_env(node.args), node.args)
+                # if isinstance(stmt, list)
+                compute_stmts.extend(stmt)
+                env[node.name] = buf
+            elif node.target == getattr or node.target == operator.getitem:
+                # todo: handle non-tensor computations correctly
+                continue
         elif node.op == 'output':
             args = node.args
             if not isinstance(args, tuple):
@@ -484,10 +645,13 @@ def nnc_compile(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
             placeholder = te.Placeholder(node.name, get_te_type(node), shapes)
             env[node.name] = placeholder.buf()
         else:
+            print(node.op, node.target)
             raise RuntimeError("not yet implemented")
 
 
     loopnest = te.LoopNest(te.Stmt(compute_stmts), outs[0])
+    loopnest.simplify()
+    # loopnest.inline_intermediate_bufs(True)
     loopnest.prepare_for_codegen()
     stmt = te.simplify(loopnest.root_stmt())
     cg = te.construct_codegen('llvm', stmt, [te.BufferArg(x) for x in [env[i.name] for i in module_attrs] + inputs + outs[0]])
@@ -513,25 +677,6 @@ def nnc_compile(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
 ################################
 
 if __name__ == '__main__':
-    # class DeepAndWide(torch.nn.Module):
-    #     def __init__(self, num_features=50):
-    #         super(DeepAndWide, self).__init__()
-    #         self.mu = torch.nn.Parameter(torch.randn(1, num_features))
-    #         self.sigma = torch.nn.Parameter(torch.randn(1, num_features))
-    #         self.fc_w = torch.nn.Parameter(torch.randn(1, num_features + 1))
-    #         self.fc_b = torch.nn.Parameter(torch.randn(1))
-
-    #     def forward(self, ad_emb_packed, user_emb, wide):
-    #         wide_offset = wide + self.mu
-    #         wide_normalized = wide_offset * self.sigma
-    #         wide_preproc = torch.clamp(wide_normalized, 0., 10.)
-    #         user_emb_t = torch.transpose(user_emb, 1, 2)
-    #         dp_unflatten = torch.bmm(ad_emb_packed, user_emb_t)
-    #         dp = torch.flatten(dp_unflatten, 1, -1)
-    #         inp = torch.cat([dp, wide_preproc], 1)
-    #         t1 = torch.transpose(self.fc_w, 1, 0)
-    #         fc1 = torch.addmm(self.fc_b, inp, t1)
-    #         return fc1
     class DeepAndWide(torch.nn.Module):
         def __init__(self, num_features=50):
             super(DeepAndWide, self).__init__()
@@ -569,7 +714,7 @@ if __name__ == '__main__':
         mod = decompose(mod, inps)
         cg = nnc_compile(mod, inps)
 
-        iters = 1000
+        iters = 100
 
         for _ in range(10):
             cg(ad_emb_packed, user_emb,wide, out_tensors=[out])

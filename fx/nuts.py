@@ -1,4 +1,5 @@
 import torch
+torch._C._jit_override_can_fuse_on_cpu(True)
 import torch.distributions as dist
 from torch.autograd import grad
 from nnc_compile import nnc_compile, decompose
@@ -82,7 +83,7 @@ def kinetic_fn(inverse_mass_matrix, p):
 
     return 0.5 * np.dot(v, p)
 
-D = 1000
+D = 100
 
 true_mean, true_std = np.ones(D), np.ones(D) * 2.
 
@@ -145,7 +146,7 @@ example_inps = (torch.randn(D),)
 potential_grad = fx_grad(decompose(potential_fn, example_inps), example_inps)
 
 """## PyTorch NUTS example: LeapFrog Integrator"""
-def leapfrog(q, p, potential_fn, inverse_mass_matrix, step_size, q_grads):
+def leapfrog(q, p, potential_fn, inverse_mass_matrix, step_size):
     r"""
     Second order symplectic integrator that uses the velocity leapfrog algorithm.
 
@@ -166,7 +167,7 @@ def leapfrog(q, p, potential_fn, inverse_mass_matrix, step_size, q_grads):
     :return tuple (q_next, p_next, q_grads, potential_energy): next position and momenta,
         together with the potential energy and its gradient w.r.t. ``q_next``.
     """
-    q_grads = potential_grad(q)[1]
+    q_grads  = potential_grad(q)[1]
 
     p = p + 0.5*step_size*(-q_grads)
 
@@ -197,10 +198,10 @@ def is_u_turning(q_i, q_f, p_f):
 
 def get_final_state(pe, m_inv, step_size, q_i, p_i):
     q, p = q_i, p_i
-    q_grads = potential_grad(q)[1]
     while not is_u_turning(q_i, q, p):
         # The function signature changes depending on whether we specialize the args.
-        q, p, q_grads, _ = leapfrog(q, p, q_grads)
+        q, p, q_grads, _ = leapfrog(q, p)
+        # q, p, q_grads, _ = leapfrog_static.run([p,])
         # q, p, q_grads, _ = leapfrog(q, p, pe, m_inv, step_size, q_grads=q_grads)
 
     return (q, p)
@@ -220,14 +221,20 @@ is_u_turning = nnc_compile(is_u_turning, example_inputs=(q_i, p_i, q_i))
 
 leapfrog = fx.symbolic_trace(leapfrog, concrete_args={'potential_fn': potential_fn, 'step_size': step_size, 'inverse_mass_matrix': inv_mass_matrix})
 leapfrog = decompose(leapfrog, example_inputs=(q_i, p_i, q_i))
+# print(leapfrog.code)
+# leapfrog = torch.jit.script(leapfrog)
+# leapfrog_static = torch._C._jit_to_static_runtime(leapfrog._c)
+# leapfrog_static.run([q_i, p_i, q_i])
+# exit(0)
 leapfrog = nnc_compile(leapfrog, example_inputs=(q_i, p_i, q_i))
 
 # These were some experiments with
 # get_final_state = fx.symbolic_trace(get_final_state, concrete_args={'pe': potential_fn, 'step_size': step_size, 'm_inv': inv_mass_matrix})
 # get_final_state = decompose(get_final_state, example_inputs=(q_i, p_i, q_i))
 # get_final_state = nnc_compile(get_final_state, example_inputs=(q_i, p_i, q_i))
+# get_final_state = torch.jit.script(get_final_state)
+# print(get_final_state.grpa
 
-begin = time.time()
 # out = get_final_state(q_i, p_i)
 out = get_final_state(potential_fn, inv_mass_matrix, step_size, q_i, p_i)
 print(out[0][0])
