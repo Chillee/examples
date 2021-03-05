@@ -1,4 +1,4 @@
-# This example is provided only for explanatory and educational purposes. The
+#, This example is provided only for explanatory and educational purposes. The
 # underlying APIs may change and this tutorial may break.
 
 # Compiling FX models to NNC (Neural Network Compiler)
@@ -109,7 +109,7 @@ def method_torch_decompose(method):
         return getattr(torch, method)(self, *args)
     return f
 
-tensor_methods_simple = ['add', 'sub', 'mul', 'div']
+tensor_methods_simple = ['add', 'sub', 'mul', 'div', 'matmul']
 
 for meth in tensor_methods_simple:
     decomposition_rules[(torch.Tensor, meth)] = method_torch_decompose(meth)
@@ -382,6 +382,8 @@ for torch_op, nnc_fn in binary_lowerings:
 def clamp_lower(inp_shapes, args):
     def f(*idxs):
         val = args[0].load(idxs)
+        # return val
+        # return te.compareSelect(val, to_expr(args[1]), val, to_expr(args[1]), te.CompareSelectOperation.GE)
         return te.ifThenElse(val < to_expr(args[1]), to_expr(args[1]),
                             te.ifThenElse(val > to_expr(args[2]), to_expr(args[2]), val))
     return f
@@ -650,14 +652,16 @@ def nnc_compile(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
 
 
     loopnest = te.LoopNest(te.Stmt(compute_stmts), outs[0])
-    loopnest.simplify()
     # loopnest.inline_intermediate_bufs(True)
+    loopnest.simplify()
+    # print(loopnest)
     loopnest.prepare_for_codegen()
     stmt = te.simplify(loopnest.root_stmt())
     cg = te.construct_codegen('llvm', stmt, [te.BufferArg(x) for x in [env[i.name] for i in module_attrs] + inputs + outs[0]])
+    alloc_results = [torch.empty(i) for i in outs[1]]
     def f(*inps, out_tensors=None):
         if out_tensors is None:
-            results = [torch.empty(i) for i in outs[1]]
+            results = alloc_results
         else:
             results = out_tensors
         if module_attrs:
