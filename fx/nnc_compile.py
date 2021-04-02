@@ -156,8 +156,8 @@ decomposition_rules[nn.Linear] = module_linear_decompose
 
 def shape_proxy(node):
     proxy = fx.Proxy(node)
-    if hasattr(node, 'shape'):
-        proxy.shape = node.shape
+    if 'shape' in node.meta:
+        proxy.shape = node.meta['shape']
         proxy.dim = lambda : len(proxy.shape)
     return proxy
 
@@ -179,13 +179,13 @@ def remove_shapes(model, example_inputs):
         if node.op == 'call_function' and node.target == torch.reshape:
             proxy_args = map_arg(node.args, lambda n: shape_proxy(env[n.name]))
             proxy_kwargs = map_arg(node.kwargs, lambda n: shape_proxy(env[n.name]))
-            new_node = torch.reshape(proxy_args[0], node.shape).node
-            new_node.shape = node.shape
+            new_node = torch.reshape(proxy_args[0], node.meta['shape']).node
+            new_node.meta = node.meta
             env[node.name] = new_node
         else:
             new_node = new_graph.node_copy(node, lambda x: env[x.name])
-            if hasattr(node, 'shape'):
-                new_node.shape = node.shape
+            if 'shape' in node.meta:
+                new_node.meta = node.meta
             env[node.name] = new_node
     new_graph.lint()
     model = fx.GraphModule(model, new_graph)
@@ -213,13 +213,13 @@ def decompose(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
                 proxy_args = map_arg(node.args, lambda n: shape_proxy(env[n.name]))
                 proxy_kwargs = map_arg(node.kwargs, lambda n: shape_proxy(env[n.name]))
                 new_node = decomposition_rules[node.target](*proxy_args, **proxy_kwargs).node
-                new_node.shape = node.shape
+                new_node.meta = node.meta
                 env[node.name] = new_node
             elif node.op == 'call_method' and (torch.Tensor, node.target) in decomposition_rules:
                 proxy_args = map_arg(node.args, lambda n: shape_proxy(env[n.name]))
                 proxy_kwargs = map_arg(node.kwargs, lambda n: shape_proxy(env[n.name]))
                 new_node = decomposition_rules[(torch.Tensor, node.target)](*proxy_args, **proxy_kwargs).node
-                new_node.shape = node.shape
+                new_node.meta = node.meta
                 env[node.name] = new_node
             elif node.op == 'call_module' and type(fetch_attr(model, node.target)) in decomposition_rules:
                 proxy_args = map_arg(node.args, lambda n: shape_proxy(env[n.name]))
@@ -232,12 +232,12 @@ def decompose(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
                 new_node = decomposition_rules[type(module)](module, *proxy_args, **proxy_kwargs).node
                 for key in unset_keys:
                     del module.__dict__[key]
-                new_node.shape = node.shape
+                new_node.meta = node.meta
                 env[node.name] = new_node
             else:
                 new_node = new_graph.node_copy(node, lambda x: env[x.name])
-                if hasattr(node, 'shape'):
-                    new_node.shape = node.shape
+                if 'shape' in node.meta:
+                    new_node.meta = node.meta
                 env[node.name] = new_node
         new_graph.lint()
         model = fx.GraphModule(model, new_graph)
@@ -560,8 +560,8 @@ lowering_functions[torch.reshape] = reshape_lower
 
 
 def lower_function(node, op, nnc_args, args):
-    inp_shapes = fx.node.map_aggregate(args, lambda arg: (arg.shape, arg.dtype) if isinstance(arg, fx.Node) and hasattr(arg, 'shape') else None)
-    out = lowering_functions[op](node.name, node.shape, inp_shapes, nnc_args)
+    inp_shapes = fx.node.map_aggregate(args, lambda arg: (arg.meta['shape'], arg.meta['dtype']) if isinstance(arg, fx.Node) and 'shape' in arg.meta else None)
+    out = lowering_functions[op](node.name, node.meta['shape'], inp_shapes, nnc_args)
     if isinstance(out, te.Tensor):
         return out.buf(), [out.stmt()]
     else:
@@ -586,7 +586,7 @@ def nnc_compile(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
 
 
     def get_te_type(node):
-        return get_nnc_type(node.dtype)
+        return get_nnc_type(node.meta['dtype'])
 
     def gen_compute(args):
         te_args = [env[arg.name] for arg in args]
@@ -612,7 +612,7 @@ def nnc_compile(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
         if node.op == 'placeholder':
             # We simply map the input placeholder to a `te.Placeholder`, which
             # also represents an input to the NNC computation.
-            shapes = get_te_shapes(node.shape)
+            shapes = get_te_shapes(node.meta['shape'])
             placeholder = te.Placeholder(node.name, get_te_type(node), shapes)
             env[node.name] = placeholder.buf()
             inputs.append(placeholder)
@@ -620,7 +620,7 @@ def nnc_compile(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
             # This does the bulk of the work - we call `lower_function`, which
             # returns a `te.ExprHandle` (the output of a NNC computation), and
             # put it in our environment.
-            if hasattr(node, 'shape'):
+            if 'shape' in node.meta:
                 # todo: fix kwargs handling
                 if node.kwargs:
                     raise RuntimeError("kwargs nyi")
@@ -638,12 +638,12 @@ def nnc_compile(model: torch.nn.Module, example_inputs) -> torch.nn.Module:
             if isinstance(args[0], tuple):
                 args = args[0]
             te_args = lookup_env(args)
-            outs = (list(te_args), [i.shape for i in args])
+            outs = (list(te_args), [i.meta['shape'] for i in args])
         elif node.op == 'get_attr':
             # As NNC doesn't have any concept of state, we pull out the module
             # attributes and pass them in as inputs to NNC.
             module_attrs.append(node)
-            shapes = get_te_shapes(node.shape)
+            shapes = get_te_shapes(node.meta['shape'])
             placeholder = te.Placeholder(node.name, get_te_type(node), shapes)
             env[node.name] = placeholder.buf()
         else:

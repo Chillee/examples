@@ -137,7 +137,7 @@ def vmap(model: torch.nn.Module, in_axes: Tuple[Optional[int], ...], example_arg
             # annotate it with the batch dimension from `in_axes`.
             new_node = new_graph.placeholder(node.name)
             new_node.bdim = next(in_axes)
-            new_node.shape = node.shape
+            new_node.meta = node.meta
             env[node.name] = new_node
         elif node.op == 'output':
             new_graph.output(env[node.args[0].name])
@@ -151,7 +151,7 @@ def vmap(model: torch.nn.Module, in_axes: Tuple[Optional[int], ...], example_arg
             else:
                 new_node = new_graph.node_copy(node, lambda x: env[x.name])
                 new_node.bdim = None
-            new_node.shape = node.shape
+            new_node.meta = node.meta
             env[node.name] = new_node
         else:
             raise RuntimeError("Not yet implemented")
@@ -208,7 +208,7 @@ def grad(model: torch.nn.Module, example_inps: Tuple[Any, ...], get_value=True) 
     orig_output = new_graph.graph_copy(fx_model.graph, val_map)
     def shape_proxy(node):
         proxy = fx.Proxy(val_map[node])
-        proxy.shape = node.shape
+        proxy.shape = node.meta['shape']
         proxy.dim = lambda : len(proxy.shape)
         return proxy
     inputs = []

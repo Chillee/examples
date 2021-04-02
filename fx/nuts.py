@@ -1,4 +1,5 @@
 import torch
+torch._C._jit_override_can_fuse_on_cpu(True)
 import torch.distributions as dist
 from torch.autograd import grad
 from nnc_compile import nnc_compile, decompose
@@ -11,6 +12,7 @@ from collections import namedtuple
 import numpy as onp
 import jax
 from vmap import grad as fx_grad
+import torch.fx as fx
 from jax import grad, jit, partial, random, value_and_grad, lax
 from jax.flatten_util import ravel_pytree
 import jax.numpy as np
@@ -120,6 +122,7 @@ q_i = {'z': np.zeros(D)}
 p_i = lambda i: {'z': random.normal(random.PRNGKey(i), (D,))}
 inv_mass_matrix = np.eye(D)
 step_size = 0.001
+seed = 1
 
 fn = jit(get_final_state, static_argnums=(0, 1))
 # fn = get_final_state
@@ -128,11 +131,11 @@ timefn = lambda i: fn(kinetic_fn, potential_fn, inv_mass_matrix,
 
 # Run only once in a loop; otherwise the best number reported
 # does not include compilation time.
-out = timefn(0)[0]['z'].block_until_ready()
+out = timefn(seed)[0]['z'].block_until_ready()
 
 begin = time.time()
 
-out = timefn(0)
+out = timefn(seed)
 print(out[0]['z'][0])
 print("jax time: ", time.time()-begin)
 
@@ -147,13 +150,12 @@ true_mean, true_std = 1, 2.
 def potential_fn(params):
     return 0.5 * torch.sum(((params - true_mean) / true_std) ** 2.0)
 
-
 if MANUAL_GRAD:
     def potential_grad(params):
         return potential_fn(params), (params-true_mean)/(true_std**2.0)
 else:
     example_inps = (torch.randn(D),)
-    potential_grad = fx_grad(decompose(potential_fn, example_inps), example_inps)
+    potential_grad = fx.symbolic_trace(fx_grad(decompose(potential_fn, example_inps), example_inps))
 
 """## PyTorch NUTS example: LeapFrog Integrator"""
 def leapfrog(q, p, potential_fn, inverse_mass_matrix, step_size):
@@ -218,7 +220,7 @@ def get_final_state(pe, m_inv, step_size, q_i, p_i):
 
 
 q_i =  torch.tensor(onp.array(q_i['z']))
-p_i =  torch.tensor(onp.array(p_i(0)['z']))
+p_i =  torch.tensor(onp.array(p_i(seed)['z']))
 inv_mass_matrix = torch.eye(D)
 # inv_mass_matrix = torch.ones(D)
 step_size = 0.001
@@ -239,6 +241,7 @@ elif VERSION == 'pt':
 
 
 
+out = get_final_state(potential_fn, inv_mass_matrix, step_size, q_i, p_i)
 begin = time.time()
 out = get_final_state(potential_fn, inv_mass_matrix, step_size, q_i, p_i)
 print(out[0][0])
