@@ -2,7 +2,7 @@ import torch
 torch._C._jit_override_can_fuse_on_cpu(True)
 import torch.distributions as dist
 from nnc_compile import nnc_compile, remove_args, truncate
-from functorch import grad_with_value, grad, wrap_key
+from functorch import grad_and_value, grad, wrap_key
 import time
 
 import jax
@@ -84,7 +84,7 @@ def kinetic_fn(inverse_mass_matrix, p):
 
     return 0.5 * np.dot(v, p)
 
-D = 25
+D = 100
 
 true_mean, true_std = np.ones(D), np.ones(D) * 2.
 
@@ -145,7 +145,7 @@ print("jax time: ", time.time()-begin)
 ###########################
 
 from nnc_compile import nnc_compile
-from functorch import grad_with_value, grad, wrap_key
+from functorch import grad_and_value, grad, wrap_key
 MANUAL_GRAD = True
 VERSION = 'jit'
 true_mean, true_std = 1., 2.
@@ -188,7 +188,7 @@ def leapfrog(q, p, potential_fn, inverse_mass_matrix, step_size):
 
     q_grads = grad(potential_fn)(q)
     # potential_energy = potential_fn(q)
-    # q_grads, potential_energy = grad_with_value(potential_fn)(q)
+    # q_grads, potential_energy = grad_and_value(potential_fn)(q)
     p = p + 0.5*step_size*(-q_grads)
 
     return q, p, q_grads, q_grads
