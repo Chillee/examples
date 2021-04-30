@@ -1,8 +1,8 @@
 import torch
 torch._C._jit_override_can_fuse_on_cpu(True)
 import torch.distributions as dist
-from torch.autograd import grad
-from nnc_compile import nnc_compile, decompose
+from nnc_compile import nnc_compile, remove_args, truncate
+from functorch import grad_with_value, grad, wrap_key
 import time
 
 import jax
@@ -84,7 +84,7 @@ def kinetic_fn(inverse_mass_matrix, p):
 
     return 0.5 * np.dot(v, p)
 
-D = 100
+D = 25
 
 true_mean, true_std = np.ones(D), np.ones(D) * 2.
 
@@ -122,7 +122,7 @@ q_i = {'z': np.zeros(D)}
 p_i = lambda i: {'z': random.normal(random.PRNGKey(i), (D,))}
 inv_mass_matrix = np.eye(D)
 step_size = 0.001
-seed = 1
+seed = 5
 
 fn = jit(get_final_state, static_argnums=(0, 1))
 # fn = get_final_state
@@ -143,19 +143,19 @@ print("jax time: ", time.time()-begin)
 ###########################
 # PyTorch Start
 ###########################
+
+from nnc_compile import nnc_compile
+from functorch import grad_with_value, grad, wrap_key
 MANUAL_GRAD = True
-VERSION = 'nnc'
-true_mean, true_std = 1, 2.
+VERSION = 'jit'
+true_mean, true_std = 1., 2.
 
 def potential_fn(params):
+    # return torch.sum((params-true_mean)**2.0)
     return 0.5 * torch.sum(((params - true_mean) / true_std) ** 2.0)
 
-if MANUAL_GRAD:
-    def potential_grad(params):
-        return potential_fn(params), (params-true_mean)/(true_std**2.0)
-else:
-    example_inps = (torch.randn(D),)
-    potential_grad = fx.symbolic_trace(fx_grad(decompose(potential_fn, example_inps), example_inps))
+def potential_grad(params):
+        return (params-true_mean)/(true_std**2.0)
 
 """## PyTorch NUTS example: LeapFrog Integrator"""
 def leapfrog(q, p, potential_fn, inverse_mass_matrix, step_size):
@@ -179,17 +179,19 @@ def leapfrog(q, p, potential_fn, inverse_mass_matrix, step_size):
     :return tuple (q_next, p_next, q_grads, potential_energy): next position and momenta,
         together with the potential energy and its gradient w.r.t. ``q_next``.
     """
-    q_grads  = potential_grad(q)[1]
+    q_grads = grad(potential_fn)(q)
 
     p = p + 0.5*step_size*(-q_grads)
 
     p_grads = _kinetic_grad(inverse_mass_matrix, p)
     q = q + step_size * p_grads  # q(n+1)
 
-    potential_energy, q_grads = potential_grad(q)
+    q_grads = grad(potential_fn)(q)
+    # potential_energy = potential_fn(q)
+    # q_grads, potential_energy = grad_with_value(potential_fn)(q)
     p = p + 0.5*step_size*(-q_grads)
 
-    return q, p, q_grads, potential_energy
+    return q, p, q_grads, q_grads
 
 
 
@@ -210,10 +212,15 @@ def is_u_turning(q_i, q_f, p_f):
 
 def get_final_state(pe, m_inv, step_size, q_i, p_i):
     q, p = q_i, p_i
+    itr = 0
     while not is_u_turning(q_i, q, p):
-        # The function signature changes depending on whether we specialize the args.
-        q, p, q_grads, _ = leapfrog(q, p)
-        # q, p, q_grads, _ = leapfrog(q, p, pe, m_inv, step_size, q_grads=q_grads)
+        q, p, q_grads, _ = leapfrog(q, p, inv_mass_matrix)
+        # itr += 1
+        # print(q, p, q_grads)
+        # exit(0)
+        # if itr == 2:
+        #     exit(0)
+        # q, p, q_grads, _ = leapfrog(q, p, pe, m_inv, step_size)
 
     return (q, p)
 
@@ -227,17 +234,21 @@ step_size = 0.001
 num_steps = 10000
 
 import torch.fx as fx
-is_u_turning = decompose(is_u_turning, example_inputs=(q_i, p_i, q_i))
-is_u_turning = nnc_compile(is_u_turning, example_inputs=(q_i, p_i, q_i))
+# is_u_turning = nnc_compile(wrap_key(is_u_turning, (q_i,p_i,q_i)), (q_i, p_i, q_i))
+# is_u_turning = nnc_compile(is_u_turning, example_inputs=(q_i, p_i, q_i))
 
-leapfrog = fx.symbolic_trace(leapfrog, concrete_args={'potential_fn': potential_fn, 'step_size': step_size, 'inverse_mass_matrix': inv_mass_matrix})
-leapfrog = decompose(leapfrog, example_inputs=(q_i, p_i, q_i))
-if VERSION == 'nnc':
-    leapfrog = nnc_compile(leapfrog, example_inputs=(q_i, p_i, q_i))
-elif VERSION == 'ts':
-    leapfrog = torch.jit.script(leapfrog)
-elif VERSION == 'pt':
-    pass
+inps = (q_i, p_i, potential_fn, inv_mass_matrix, step_size)
+leapfrog = fx.symbolic_trace(wrap_key(leapfrog, inps))
+leapfrog = remove_args(leapfrog)
+# leapfrog = truncate(leapfrog, 7)
+# leapfrog = fx.symbolic_trace(leapfrog, concrete_args={'potential_fn': potential_fn, 'step_size': step_size, 'inverse_mass_matrix': inv_mass_matrix})
+
+# if VERSION == 'nnc':
+leapfrog = nnc_compile(leapfrog, example_inputs=(q_i, p_i, inv_mass_matrix))
+# elif VERSION == 'ts':
+#     leapfrog = torch.jit.script(leapfrog)
+# elif VERSION == 'pt':
+#     pass
 
 
 
